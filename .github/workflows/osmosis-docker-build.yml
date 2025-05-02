@@ -1,0 +1,315 @@
+name: Build and Publish Osmosis Docker Images
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Run weekly on Sunday at midnight
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  check-osmosis-version:
+    name: Check for Osmosis updates
+    runs-on: ubuntu-latest
+    outputs:
+      osmosis_version: ${{ steps.compare_version.outputs.osmosis_version }}
+      is_new_version: ${{ steps.compare_version.outputs.is_new_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Token Permissions
+        run: |
+          curl -i -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/actions/permissions
+
+      - name: Get latest Osmosis version from upstream
+        id: get_upstream
+        run: |
+          UPSTREAM_VERSION=$(curl -s https://api.github.com/repos/openstreetmap/osmosis/releases/latest | jq -r .tag_name)
+          echo "upstream_version=${UPSTREAM_VERSION}" >> $GITHUB_OUTPUT
+          echo "Latest upstream version: ${UPSTREAM_VERSION}"
+
+      - name: Get current Osmosis version from repository variables
+        id: get_version
+        run: |
+          CURRENT_VERSION="${{ vars.OSMOSIS_VERSION }}"
+          echo "current_version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "There is no stored version of osmosis"
+          else
+            echo "Current stored version: ${CURRENT_VERSION}"
+          fi
+
+      - name: Compare versions
+        id: compare_version
+        run: |
+          CURRENT_VERSION="${{ steps.get_version.outputs.current_version }}"
+          UPSTREAM_VERSION="${{ steps.get_upstream.outputs.upstream_version }}"
+
+          # Compare versions
+          if [ "$CURRENT_VERSION" != "$UPSTREAM_VERSION" ]; then
+            echo "New version available: $UPSTREAM_VERSION (current: ${CURRENT_VERSION:-none})"
+            echo "is_new_version=true" >> $GITHUB_OUTPUT
+            echo "osmosis_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "Current version is up to date: $CURRENT_VERSION"
+            echo "is_new_version=false" >> $GITHUB_OUTPUT
+            echo "osmosis_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download new Osmosis version
+        if: steps.compare_version.outputs.is_new_version == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          OSMOSIS_VERSION="${{ steps.compare_version.outputs.osmosis_version }}"
+          # DOWNLOAD_URL="https://github.com/openstreetmap/osmosis/releases/download/${OSMOSIS_VERSION}/osmosis-${OSMOSIS_VERSION}.zip"
+          DOWNLOAD_URL="$(curl -s https://api.github.com/repos/openstreetmap/osmosis/releases/latest | jq -r '.assets[] | select(.content_type == "application/x-zip-compressed") | .browser_download_url')"
+
+          echo "Downloading Osmosis ${OSMOSIS_VERSION} from ${DOWNLOAD_URL}"
+          curl -L -O "${DOWNLOAD_URL}"
+
+          echo "Extracting Osmosis archive"
+          unzip ./osmosis-${OSMOSIS_VERSION}.zip
+          mv ./osmosis-${OSMOSIS_VERSION} ./osmosis
+
+      - name: Upload Osmosis as artifact
+        if: steps.compare_version.outputs.is_new_version == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmosis
+          path: ./osmosis/
+          retention-days: 1
+
+      - name: No new version available
+        if: steps.compare_version.outputs.is_new_version == 'false'
+        run: |
+            echo "No new version is available. Using current version: ${{ steps.get_version.outputs.current_version }}"
+
+  prepare-build:
+    name: Prepare build metadata
+    runs-on: ubuntu-latest
+    needs: check-osmosis-version
+    if: needs.check-osmosis-version.outputs.is_new_version == 'true' || github.event_name == 'workflow_dispatch'
+    outputs:
+      jre_name: ${{ steps.parse_base_image.outputs.jre_name }}
+      jre_version: ${{ steps.parse_base_image.outputs.jre_version }}
+      distro_name: ${{ steps.parse_base_image.outputs.distro_name }}
+      distro_version: ${{ steps.parse_base_image.outputs.distro_version }}
+      osmosis_version: ${{ needs.check-osmosis-version.outputs.osmosis_version }}
+      osmosis_hash: ${{ steps.get_osmosis_commit.outputs.release_hash }}
+      base_image: ${{ steps.get_base_image.outputs.base_image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get name of a base image from repository variables
+        id: get_base_image
+        run: |
+          BASE_IMAGE="${{ vars.JRE_BASE_IMAGE }}"
+
+          if [ -z "$BASE_IMAGE" ]; then
+            BASE_IMAGE="eclipse-temurin:24.0.1_9-jdk-alpine-3.21"
+            echo "JRE_BASE_IMAGE variable not set, using default: ${BASE_IMAGE}"
+          else
+            echo "Using JRE_BASE_IMAGE from repo variables: ${BASE_IMAGE}"
+          fi
+
+          echo "base_image=${BASE_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Parse base image name
+        id: parse_base_image
+        run: |
+          BASE_IMAGE="${{ steps.get_base_image.outputs.base_image }}"
+          # Expected format: eclipse-temurin:24.0.1_9-jdk-alpine-3.21
+
+          # Extract JRE name
+          JRE_NAME=$(echo $BASE_IMAGE | cut -d':' -f1)
+          echo "jre_name=${JRE_NAME}" >> $GITHUB_OUTPUT
+
+          # Extract JRE version (semver)
+          JRE_VERSION=$(echo $BASE_IMAGE | cut -d':' -f2 | cut -d'-' -f1 | cut -d'_' -f1)
+          echo "jre_version=${JRE_VERSION}" >> $GITHUB_OUTPUT
+
+          # Extract distro name
+          DISTRO_NAME=$(echo $BASE_IMAGE | sed -E 's/.*-jdk-([a-z]+(-[0-9]+(\.[0-9]+)*)).*/\1/' | cut -d'-' -f1)
+          echo "distro_name=${DISTRO_NAME}" >> $GITHUB_OUTPUT
+
+          # Extract distro version
+          DISTRO_VERSION=$(echo $BASE_IMAGE | grep -o '[0-9]\+\.[0-9]\+$')
+          echo "distro_version=${DISTRO_VERSION}" >> $GITHUB_OUTPUT
+
+          echo "JRE name: ${JRE_NAME}"
+          echo "JRE version: ${JRE_VERSION}"
+          echo "Distro name: ${DISTRO_NAME}"
+          echo "Distro version: ${DISTRO_VERSION}"
+
+      - name: Get Osmosis release hash
+        id: get_osmosis_commit
+        run: |
+          RELEASE_TAG=${{ needs.check-osmosis-version.outputs.osmosis_version }}
+          RELEASE_TAG_SHA=$(curl -s "https://api.github.com/repos/openstreetmap/osmosis/git/refs/tags/$RELEASE_TAG" | jq -r '.object.sha')
+          echo "release_tag_hash=${RELEASE_TAG_SHA}" >> $GITHUB_OUTPUT
+          echo "Release tag hash: ${RELEASE_TAG_SHA}"
+
+          RELEASE_SHA=$(curl -s "https://api.github.com/repos/openstreetmap/osmosis/git/tags/$RELEASE_TAG_SHA" | jq -r '.object.sha')
+          echo "release_hash=${RELEASE_SHA}" >> $GITHUB_OUTPUT
+          echo "Release hash: ${RELEASE_SHA}"
+
+  build-and-push:
+    needs: [check-osmosis-version, prepare-build]
+    if: needs.check-osmosis-version.outputs.is_new_version == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        registry:
+          - ghcr.io
+          - docker.io
+          - quay.io
+    name: Build and push to ${{ matrix.registry }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get registry credentials ${{ matrix.registry }}
+        id: get_registry_credentials
+        run: |
+          REG="${{ matrix.registry }}"
+          echo "Processing ${REG} credentials"
+          case "${REG}" in
+            "ghcr.io")
+              echo "registry_login=${{ github.actor }}" >> $GITHUB_OUTPUT
+              echo "registry_token=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_OUTPUT
+
+              ;;
+            "docker.io")
+              echo "registry_login=${{ secrets.DOCKERHUB_LOGIN }}" >> $GITHUB_OUTPUT
+              echo "registry_token=${{ secrets.DOCKERHUB_TOKEN }}" >> $GITHUB_OUTPUT
+              ;;
+            "quay.io")
+              echo "registry_login=${{ secrets.QUAY_LOGIN }}" >> $GITHUB_OUTPUT
+              echo "registry_token=${{ secrets.QUAY_TOKEN }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              ;;
+          esac
+      - name: Check registry credential
+        id: check_registry_credentials
+        run: |
+          if [ -z "${{ steps.get_registry_credentials.outputs.registry_login }}" ] || [ -z "${{ steps.get_registry_credentials.outputs.registry_token }}" ]; then
+            echo "is_registry_credential=false" >> $GITHUB_OUTPUT
+            echo "There is no credential for ${{ matrix.registry }} in your repo"
+          else
+            echo "is_registry_credential=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to ${{ matrix.registry }} container registry
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ matrix.registry }}
+          username: ${{ steps.get_registry_credentials.outputs.registry_login }}
+          password: ${{ steps.get_registry_credentials.outputs.registry_token }}
+
+      - name: Set up QEMU
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download Osmosis artifact
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: osmosis
+          path: ./osmosis/
+
+      - name: Set release date (timestamp)
+        run: |
+          echo "BUILD_TIME=$(date --utc +%FT%T.%3NZ)" >> ${GITHUB_ENV}
+          echo "Release timestamp: $BUILD_TIME"
+
+      - name: Docker image meta information
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{matrix.registry}}/${{ github.repository_owner }}/osmosis
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(needs.check-osmosis-version.outputs.osmosis_version, '0.') }},value=${{ needs.check-osmosis-version.outputs.osmosis_version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check-osmosis-version.outputs.osmosis_version }}
+            type=semver,pattern={{version}},value=${{ needs.check-osmosis-version.outputs.osmosis_version }}
+            type=raw,value=${{ needs.check-osmosis-version.outputs.osmosis_version }}-${{ needs.prepare-build.outputs.jre_name }}-${{ needs.prepare-build.outputs.jre_version }}
+            type=raw,value=${{ needs.check-osmosis-version.outputs.osmosis_version }}-${{ needs.prepare-build.outputs.jre_name }}-${{ needs.prepare-build.outputs.jre_version }}-${{ needs.prepare-build.outputs.distro_name }}
+            type=raw,value=${{ needs.check-osmosis-version.outputs.osmosis_version }}-${{ needs.prepare-build.outputs.jre_name }}-${{ needs.prepare-build.outputs.jre_version }}-${{ needs.prepare-build.outputs.distro_name }}-${{ needs.prepare-build.outputs.distro_version }}
+          labels: |
+            org.opencontainers.image.maintainer=Andrii Holovin
+            org.opencontainers.image.created=${{ env.BUILD_TIME }}
+            org.opencontainers.image.authors=Brett Henderson and OSM Contributors
+            org.opencontainers.image.url=https://github.com/Andygol/osmosis-docker
+            org.opencontainers.image.documentation=https://wiki.openstreetmap.org/wiki/Osmosis
+            org.opencontainers.image.source=https://github.com/openstreetmap/osmosis
+            org.opencontainers.image.version=${{ needs.check-osmosis-version.outputs.osmosis_version }}
+            org.opencontainers.image.revision=${{ needs.prepare-build.outputs.osmosis_hash }}
+            org.opencontainers.image.vendor=OpenStreetMap and its contributors
+            org.opencontainers.image.licenses=CC0-1.0,PDDL-1.0
+            org.opencontainers.image.ref.name=osmosis:${{ needs.check-osmosis-version.outputs.osmosis_version }}
+            org.opencontainers.image.title=Osmosis
+            org.opencontainers.image.description=Osmosis is a command line Java application for processing OpenStreetMap data. The tool consists of pluggable components that can be chained to perform a larger operation.
+            org.opencontainers.image.base.name=${{ needs.prepare-build.outputs.base_image }}
+
+      - name: Build and push Docker image to ${{ matrix.registry }}
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        id: build_push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            JRE_BASE_IMAGE=${{ needs.prepare-build.outputs.base_image }}
+            JRE_VERSION=${{ needs.prepare-build.outputs.jre_version }}
+
+      - name: Generate artifact attestation
+        if: steps.check_registry_credentials.outputs.is_registry_credential == 'true'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-digest: ${{ steps.build_push.outputs.digest}}
+          subject-name: ${{matrix.registry}}/${{ github.repository_owner }}/osmosis
+          push-to-registry: true
+
+  update-osmosis-version:
+    if: needs.check-osmosis-version.outputs.is_new_version == 'true'
+    needs: [check-osmosis-version, build-and-push]
+    name: Update Osmosis version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update repository variable
+        env:
+          GH_TOKEN: ${{ secrets.OSMOSIS_VERSION_TOKEN }}
+        run: |
+          NEW_VERSION="${{ needs.check-osmosis-version.outputs.osmosis_version }}"
+          gh variable set OSMOSIS_VERSION -b "${NEW_VERSION}"
+          echo "Updated OSMOSIS_VERSION to ${NEW_VERSION}"
